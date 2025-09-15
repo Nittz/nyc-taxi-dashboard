@@ -2,16 +2,20 @@ import os, json, pandas as pd, plotly.express as px, streamlit as st
 
 st.set_page_config(page_title="NYC Yellow Taxi — Jun–Jul 2025", layout="wide")
 
-# ===== CONFIG QUE VOCÊ PODE MUDAR =====
-BUCKET = os.getenv("BUCKET", "nyc-taxi-portfolio-frm")  # troque se usar outro bucket
-PREFIX = os.getenv("PREFIX", "agg")                      # onde estão os CTAS
-S3_ANON = os.getenv("S3_ANON", "true").lower() == "true" # True se agg/* for público
-
+BUCKET = os.getenv("BUCKET", "nyc-taxi-portfolio-frm")
+PREFIX = os.getenv("PREFIX", "agg")
 S3_PATH = f"s3://{BUCKET}/{PREFIX}"
-STORAGE_OPTS = {"anon": True} if S3_ANON else {}
 
-# ===== CARREGA PARQUETS (gerados no Athena CTAS) =====
-daily   = pd.read_parquet(f"{S3_PATH}/agg_daily/", storage_options=STORAGE_OPTS)
+# Use credenciais se existirem; caso contrário, cai para leitura anônima
+_has_keys = all(k in os.environ for k in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
+STORAGE_OPTS = {} if _has_keys else {"anon": True}
+if _has_keys and os.getenv("AWS_DEFAULT_REGION"):
+    STORAGE_OPTS["client_kwargs"] = {"region_name": os.getenv("AWS_DEFAULT_REGION")}
+
+# (debug opcional) veja como está sendo lido:
+# st.write("storage_options=", STORAGE_OPTS)
+
+daily   = pd.read_parquet(f"{S3_PATH}/agg_daily/",   storage_options=STORAGE_OPTS)
 hourdow = pd.read_parquet(f"{S3_PATH}/agg_hour_dow/", storage_options=STORAGE_OPTS)
 zonepu  = pd.read_parquet(f"{S3_PATH}/agg_zone_pickup/", storage_options=STORAGE_OPTS)
 pay     = pd.read_parquet(f"{S3_PATH}/agg_payment/", storage_options=STORAGE_OPTS)
