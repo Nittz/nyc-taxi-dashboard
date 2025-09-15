@@ -1,3 +1,0 @@
-mkdir -p data
-curl -L -o data/taxi_zones.geojson \
-'https://data.cityofnewyork.us/api/geospatial/8meu-9t5y?method=export&format=GeoJSON'
