@@ -108,10 +108,16 @@ k5.metric("Distância média (mi)", f"{daily_f['avg_trip_miles'].mean():.2f}")
 
 # ========= CHARTS =========
 # Série diária
-st.plotly_chart(
-    px.line(daily_f, x="pickup_date", y="trips", title="Viagens por dia"),
-    use_container_width=True,
+# garantir 1 linha por dia e ordenar
+series_daily = (
+    daily_f.loc[:, ["pickup_date", "trips"]]
+            .groupby("pickup_date", as_index=False)["trips"].sum()
+            .sort_values("pickup_date")
 )
+fig_daily = px.line(series_daily, x="pickup_date", y="trips", markers=True,
+                    title="Viagens por dia")
+st.plotly_chart(fig_daily, use_container_width=True)
+
 
 # Heatmap hora × dia-da-semana
 heat = hourdow_f.pivot_table(index="pickup_dow_num", columns="pickup_hour",
