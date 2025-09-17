@@ -15,7 +15,7 @@ S3_BASE = f"s3://{BUCKET}/{PREFIX}"
 # Subprefixo que contém os dados com timestamp
 RAW_SUBPATHS = [
     "yellow_trips_2025/",  # preferido
-    "trips/",              # alternativas comums
+    "trips/",              # alternativas comumns
     ""
 ]
 
@@ -107,4 +107,122 @@ except Exception as e:
     st.info(
         "Se o bucket for privado, preencha em Settings → Secrets: "
         "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION "
-        "além de (opcional)
+        "além de (opcional) BUCKET/PREFIX. "
+        "Alternativa: torne público o prefixo."
+    )
+    st.stop()
+
+guard_df(base, "base com timestamp")
+
+# Tipos e colunas auxiliares
+base["pickup_datetime"] = pd.to_datetime(base["pickup_datetime"], errors="coerce")
+base = base.dropna(subset=["pickup_datetime"]).copy()
+base["pickup_date"] = base["pickup_datetime"].dt.date
+base["pickup_hour"] = base["pickup_datetime"].dt.hour
+# 1..7 (Seg=1 .. Dom=7) para compatibilidade com seu heatmap anterior
+base["pickup_dow_num"] = base["pickup_datetime"].dt.dayofweek + 1
+
+# ========= GEOJSON =========
+taxi_gj = load_taxi_geojson()
+zone_lkp = build_zone_lookup_from_geojson(taxi_gj)
+
+# ========= UI / FILTERS =========
+st.title("🚕 NYC Yellow Taxi — Jun–Jul 2025")
+st.caption(
+    "Fonte: NYC TLC Trip Record Data (Parquet no S3) • Filtro global por data e hora • "
+    "Mapa: NYC Taxi Zones (GeoJSON)."
+)
+
+min_d, max_d = base["pickup_date"].min(), base["pickup_date"].max()
+c1, c2 = st.columns([2, 1])
+dr = c1.date_input("Período", [min_d, max_d], min_value=min_d, max_value=max_d)
+hr_min, hr_max = c2.select_slider("Hora (pickup)", options=list(range(24)), value=(0, 23))
+
+# Filtro global (aplicado uma única vez)
+d0, d1 = pd.to_datetime(dr[0]).date(), pd.to_datetime(dr[1]).date()
+mask = (
+    (base["pickup_date"] >= d0) &
+    (base["pickup_date"] <= d1) &
+    (base["pickup_hour"] >= hr_min) &
+    (base["pickup_hour"] <= hr_max)
+)
+df_filtered = base.loc[mask].copy()
+guard_df(df_filtered, "df_filtered (após filtros de data+hora)")
+
+# ========= KPIs (derivados do filtrado) =========
+# Nem todos os Parquets têm todas as colunas; calcular de forma defensiva
+trips_total = int(len(df_filtered))
+revenue_total = float(df_filtered["total_amount"].sum()) if "total_amount" in df_filtered.columns else 0.0
+fare_sum = float(df_filtered["fare_amount"].sum()) if "fare_amount" in df_filtered.columns else 0.0
+tip_sum = float(df_filtered["tip_amount"].sum()) if "tip_amount" in df_filtered.columns else 0.0
+dist_sum = float(df_filtered["trip_distance"].sum()) if "trip_distance" in df_filtered.columns else 0.0
+
+avg_fare = (fare_sum / trips_total) if trips_total and fare_sum else 0.0
+avg_tip_pct = (tip_sum / fare_sum) if fare_sum else 0.0
+avg_miles = (dist_sum / trips_total) if trips_total and dist_sum else 0.0
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Viagens", f"{trips_total:,}")
+k2.metric("Receita ($)", f"{revenue_total:,.0f}")
+k3.metric("Tarifa média ($)", f"{avg_fare:.2f}")
+k4.metric("Tip % médio", f"{100 * avg_tip_pct:.1f}%")
+k5.metric("Distância média (mi)", f"{avg_miles:.2f}")
+
+# ========= CHARTS (todos a partir do df_filtered) =========
+# Série diária
+daily = (
+    df_filtered.groupby("pickup_date", as_index=False)
+    .agg(trips=("pickup_datetime", "count"))
+    .sort_values("pickup_date")
+)
+st.plotly_chart(
+    px.line(daily, x="pickup_date", y="trips", title="Viagens por dia"),
+    use_container_width=True,
+)
+
+# Heatmap hora × dia-da-semana (como antes, mas do filtrado)
+heat = (
+    df_filtered.groupby(["pickup_dow_num", "pickup_hour"], as_index=False)
+    .agg(trips=("pickup_datetime", "count"))
+    .pivot(index="pickup_dow_num", columns="pickup_hour", values="trips")
+    .fillna(0)
+)
+st.plotly_chart(
+    px.imshow(heat, aspect="auto", title="Heatmap (dia da semana × hora)"),
+    use_container_width=True,
+)
+
+# Ranking de zonas (top 15 por trips) — juntando nomes a partir do GeoJSON
+by_zone = (
+    df_filtered.groupby("pulocationid", as_index=False)
+    .agg(trips=("pickup_datetime", "count"),
+         revenue_total=("total_amount", "sum") if "total_amount" in df_filtered.columns else ("pickup_datetime","count"))
+)
+by_zone = by_zone.merge(zone_lkp, on="pulocationid", how="left")
+top = (
+    by_zone.sort_values("trips", ascending=False)
+    .loc[:, ["borough", "zone", "trips", "revenue_total"]]
+    .head(15)
+)
+st.dataframe(top, use_container_width=True)
+
+# Mapa por zona (match por ID: properties.LocationID ↔ pulocationid)
+mapdf = by_zone[["pulocationid", "trips"]].rename(columns={"pulocationid": "LocationID"})
+fig = px.choropleth_mapbox(
+    mapdf,
+    geojson=taxi_gj,
+    locations="LocationID",
+    featureidkey="properties.LocationID",
+    color="trips",
+    mapbox_style="open-street-map",  # sem token
+    zoom=9,
+    center={"lat": 40.7128, "lon": -74.0060},
+    opacity=0.6,
+    title="Pickups por zona (filtrado por data e hora)",
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.caption(
+    "Todos os visuais e KPIs derivam do mesmo df_filtered (data+hora). "
+    "Para renomear zonas/bairros no ranking, os nomes vêm do próprio GeoJSON."
+)
