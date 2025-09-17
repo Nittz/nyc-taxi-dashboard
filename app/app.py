@@ -3,39 +3,23 @@ import os, json, requests
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from datetime import date
 
 st.set_page_config(page_title="NYC Yellow Taxi — Jun–Jul 2025", layout="wide")
 
 # ========= CONFIG =========
-# Ajuste via Secrets/Env:
 BUCKET = os.getenv("BUCKET", "nyc-taxi-portfolio-frm")
-PREFIX = os.getenv("PREFIX", "agg_v3")  # usa agg_v3 como padrão
-S3_BASE = f"s3://{BUCKET}/{PREFIX}"
-# Subprefixo que contém os dados com timestamp
-RAW_SUBPATHS = [
-    "yellow_trips_2025/",  # preferido
-    "trips/",              # alternativas comumns
-    ""
-]
+PREFIX = os.getenv("PREFIX", "agg_v3")  # mantém agg_v3
+S3_PATH = f"s3://{BUCKET}/{PREFIX}"
 
-# Se houver AWS keys, usa; senão tenta leitura anônima
 _has_keys = bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
 STORAGE_OPTS: dict = {} if _has_keys else {"anon": True}
 if _has_keys and os.getenv("AWS_DEFAULT_REGION"):
     STORAGE_OPTS["client_kwargs"] = {"region_name": os.getenv("AWS_DEFAULT_REGION")}
 
 # ========= HELPERS =========
-GEOJSON_URL = (
-    "https://data.cityofnewyork.us/api/geospatial/8meu-9t5y?method=export&format=GeoJSON"
-)  # NYC Taxi Zones (GeoJSON) — NYC Open Data
+GEOJSON_URL = "https://data.cityofnewyork.us/api/geospatial/8meu-9t5y?method=export&format=GeoJSON"
 
 def load_taxi_geojson():
-    """
-    1) tenta 'data/NYC Taxi Zones.geojson'
-    2) tenta 'data/taxi_zones.geojson'
-    3) fallback: baixa GeoJSON oficial do NYC Open Data
-    """
     candidates = ["data/NYC Taxi Zones.geojson", "data/taxi_zones.geojson"]
     for path in candidates:
         if os.path.exists(path):
@@ -54,136 +38,125 @@ def load_taxi_geojson():
 def read_parquet_dir(path: str) -> pd.DataFrame:
     return pd.read_parquet(path, storage_options=STORAGE_OPTS)
 
-def load_base_with_timestamp() -> pd.DataFrame:
-    """
-    Carrega a base com timestamp (tpep_pickup_datetime).
-    Tenta em ordem os subprefixos definidos em RAW_SUBPATHS.
-    """
-    last_err = None
-    for sub in RAW_SUBPATHS:
-        path = f"{S3_BASE}/{sub}" if sub else f"{S3_BASE}/"
-        try:
-            df = read_parquet_dir(path)
-            # Padroniza o nome do carimbo de data/hora
-            if "pickup_datetime" not in df.columns:
-                for c in ["tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_ts"]:
-                    if c in df.columns:
-                        df = df.rename(columns={c: "pickup_datetime"})
-                        break
-            if "pickup_datetime" not in df.columns:
-                raise ValueError("Coluna de timestamp não encontrada.")
-            return df
-        except Exception as e:
-            last_err = e
-            continue
-    # Se nada deu certo, erra com diagnóstico do último caminho tentado
-    raise RuntimeError(f"Falha ao ler base com timestamp em {S3_BASE} (detalhe: {last_err})")
-
-def build_zone_lookup_from_geojson(geojson: dict) -> pd.DataFrame:
-    """
-    Extrai LocationID, zone e borough do GeoJSON para mostrar nomes no ranking.
-    """
-    rows = []
-    for feat in geojson.get("features", []):
-        props = feat.get("properties", {})
-        if "LocationID" in props:
-            rows.append({
-                "pulocationid": int(props["LocationID"]),
-                "zone": props.get("zone"),
-                "borough": props.get("borough"),
-            })
-    return pd.DataFrame(rows)
-
 def guard_df(df: pd.DataFrame, name: str):
     if df is None or len(df) == 0:
-        st.error(f"Nenhum dado em {name}. Confira no S3: {S3_BASE}")
+        st.error(f"Nenhum dado em {name}. Confira no S3: {S3_PATH}/{name}/")
         st.stop()
 
-# ========= LOAD DATA (AGORA UMA ÚNICA BASE) =========
+# ========= LOAD DATA =========
 try:
-    base = load_base_with_timestamp()
+    daily   = read_parquet_dir(f"{S3_PATH}/agg_daily/")
+    hourdow = read_parquet_dir(f"{S3_PATH}/agg_hour_dow/")
+    zonepu  = read_parquet_dir(f"{S3_PATH}/agg_zone_pickup/")
+    pay     = read_parquet_dir(f"{S3_PATH}/agg_payment/")
 except Exception as e:
-    st.error(f"Erro ao ler Parquet no S3 ({S3_BASE}). Detalhe: {e}")
-    st.info(
-        "Se o bucket for privado, preencha em Settings → Secrets: "
-        "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION "
-        "além de (opcional) BUCKET/PREFIX. "
-        "Alternativa: torne público o prefixo."
-    )
+    st.error(f"Erro ao ler Parquet no S3 ({S3_PATH}). Detalhe: {e}")
     st.stop()
 
-guard_df(base, "base com timestamp")
+guard_df(daily,   "agg_daily")
+guard_df(hourdow, "agg_hour_dow")
+guard_df(zonepu,  "agg_zone_pickup")
+guard_df(pay,     "agg_payment")
 
-# Tipos e colunas auxiliares
-base["pickup_datetime"] = pd.to_datetime(base["pickup_datetime"], errors="coerce")
-base = base.dropna(subset=["pickup_datetime"]).copy()
-base["pickup_date"] = base["pickup_datetime"].dt.date
-base["pickup_hour"] = base["pickup_datetime"].dt.hour
-# 1..7 (Seg=1 .. Dom=7) para compatibilidade com seu heatmap anterior
-base["pickup_dow_num"] = base["pickup_datetime"].dt.dayofweek + 1
+# Tipos
+daily["pickup_date"] = pd.to_datetime(daily["pickup_date"])
+pay["pickup_date"]   = pd.to_datetime(pay["pickup_date"])
 
 # ========= GEOJSON =========
 taxi_gj = load_taxi_geojson()
-zone_lkp = build_zone_lookup_from_geojson(taxi_gj)
 
 # ========= UI / FILTERS =========
 st.title("🚕 NYC Yellow Taxi — Jun–Jul 2025")
 st.caption(
-    "Fonte: NYC TLC Trip Record Data (Parquet no S3) • Filtro global por data e hora • "
-    "Mapa: NYC Taxi Zones (GeoJSON)."
+    "Fonte: NYC TLC Trip Record Data (Parquet) • Pré-agregações (Athena) • "
+    "Filtro de HORA aplicado globalmente por ponderação via distribuição Hora×DOW."
 )
 
-min_d, max_d = base["pickup_date"].min(), base["pickup_date"].max()
+min_d, max_d = daily["pickup_date"].min().date(), daily["pickup_date"].max().date()
 c1, c2 = st.columns([2, 1])
 dr = c1.date_input("Período", [min_d, max_d], min_value=min_d, max_value=max_d)
 hr_min, hr_max = c2.select_slider("Hora (pickup)", options=list(range(24)), value=(0, 23))
 
-# Filtro global (aplicado uma única vez)
-d0, d1 = pd.to_datetime(dr[0]).date(), pd.to_datetime(dr[1]).date()
-mask = (
-    (base["pickup_date"] >= d0) &
-    (base["pickup_date"] <= d1) &
-    (base["pickup_hour"] >= hr_min) &
-    (base["pickup_hour"] <= hr_max)
+# ========= DERIVAÇÕES PARA FILTRO DE HORA =========
+# 1) Razão por dia-da-semana (DOW): qual fração das viagens cai dentro do intervalo de horas escolhido?
+#    Base: agg_hour_dow (colunas típicas: pickup_dow_num [1=seg..7=dom], pickup_hour, trips)
+hourdow = hourdow.copy()
+assert {"pickup_dow_num", "pickup_hour", "trips"}.issubset(hourdow.columns), "agg_hour_dow com colunas inesperadas."
+
+dow_tot = hourdow.groupby("pickup_dow_num", as_index=True)["trips"].sum()
+dow_sel = (
+    hourdow[
+        (hourdow["pickup_hour"] >= hr_min) & (hourdow["pickup_hour"] <= hr_max)
+    ]
+    .groupby("pickup_dow_num", as_index=True)["trips"].sum()
 )
-df_filtered = base.loc[mask].copy()
-guard_df(df_filtered, "df_filtered (após filtros de data+hora)")
+ratio_by_dow = (dow_sel / dow_tot).fillna(0).clip(0, 1)  # Series: index = DOW (1..7)
 
-# ========= KPIs (derivados do filtrado) =========
-# Nem todos os Parquets têm todas as colunas; calcular de forma defensiva
-trips_total = int(len(df_filtered))
-revenue_total = float(df_filtered["total_amount"].sum()) if "total_amount" in df_filtered.columns else 0.0
-fare_sum = float(df_filtered["fare_amount"].sum()) if "fare_amount" in df_filtered.columns else 0.0
-tip_sum = float(df_filtered["tip_amount"].sum()) if "tip_amount" in df_filtered.columns else 0.0
-dist_sum = float(df_filtered["trip_distance"].sum()) if "trip_distance" in df_filtered.columns else 0.0
+# 2) Série diária/KPIs: mapeia pickup_date -> DOW(1..7) e aplica a razão
+daily_f = daily[(daily.pickup_date >= pd.to_datetime(dr[0])) & (daily.pickup_date <= pd.to_datetime(dr[1]))].copy()
+daily_f["pickup_dow_num"] = daily_f["pickup_date"].dt.dayofweek + 1
+daily_f["__ratio"] = daily_f["pickup_dow_num"].map(ratio_by_dow).fillna(0)
 
-avg_fare = (fare_sum / trips_total) if trips_total and fare_sum else 0.0
-avg_tip_pct = (tip_sum / fare_sum) if fare_sum else 0.0
-avg_miles = (dist_sum / trips_total) if trips_total and dist_sum else 0.0
+# Escalonamento de métricas acumuláveis (se existirem); defensivo com colunas opcionais
+for col in ["trips", "revenue_total", "fare_sum", "tip_sum", "distance_sum"]:
+    if col in daily_f.columns:
+        daily_f[f"{col}__hr"] = daily_f[col] * daily_f["__ratio"]
 
+# KPIs ponderados (preferir somas -> médios calculados a partir das somas)
+trips_total   = int(daily_f.get("trips__hr", daily_f.get("trips", pd.Series(dtype=float))).sum())
+revenue_total = float(daily_f.get("revenue_total__hr", daily_f.get("revenue_total", pd.Series(dtype=float))).sum())
+fare_sum      = float(daily_f.get("fare_sum__hr", pd.Series(dtype=float)).sum())
+tip_sum       = float(daily_f.get("tip_sum__hr", pd.Series(dtype=float)).sum())
+dist_sum      = float(daily_f.get("distance_sum__hr", pd.Series(dtype=float)).sum())
+
+def safe_div(a, b): return (a / b) if (b and b != 0) else 0.0
+avg_fare    = safe_div(fare_sum, trips_total) if fare_sum else (float(daily_f.get("avg_fare", pd.Series([0])).mean()) if trips_total else 0.0)
+avg_tip_pct = safe_div(tip_sum, fare_sum) if fare_sum else (float(daily_f.get("avg_tip_pct", pd.Series([0])).mean()))
+avg_miles   = safe_div(dist_sum, trips_total) if dist_sum else (float(daily_f.get("avg_trip_miles", pd.Series([0])).mean()) if trips_total else 0.0)
+
+# 3) Pagamentos por dia/tipo: aplica a mesma razão via DOW da data
+pay_f = pay[(pay.pickup_date >= pd.to_datetime(dr[0])) & (pay.pickup_date <= pd.to_datetime(dr[1]))].copy()
+if not pay_f.empty:
+    pay_f["pickup_dow_num"] = pay_f["pickup_date"].dt.dayofweek + 1
+    pay_f["__ratio"] = pay_f["pickup_dow_num"].map(ratio_by_dow).fillna(0)
+    # Escala colunas acumuláveis se existirem
+    for col in ["trips", "revenue_total", "fare_sum", "tip_sum"]:
+        if col in pay_f.columns:
+            pay_f[f"{col}__hr"] = pay_f[col] * pay_f["__ratio"]
+
+# 4) Zonas (totalizadas no período): sem data, aplicamos um fator global (aproximação)
+#    fator_global = (trips nas horas selecionadas) / (trips em 24h), considerando toda a base de hourdow
+sel_all = hourdow[(hourdow["pickup_hour"] >= hr_min) & (hourdow["pickup_hour"] <= hr_max)]["trips"].sum()
+tot_all = hourdow["trips"].sum()
+global_ratio = float(sel_all / tot_all) if tot_all else 0.0
+
+# ========= KPIs =========
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Viagens", f"{trips_total:,}")
+k1.metric("Viagens (horas selecionadas)", f"{trips_total:,}")
 k2.metric("Receita ($)", f"{revenue_total:,.0f}")
 k3.metric("Tarifa média ($)", f"{avg_fare:.2f}")
 k4.metric("Tip % médio", f"{100 * avg_tip_pct:.1f}%")
 k5.metric("Distância média (mi)", f"{avg_miles:.2f}")
 
-# ========= CHARTS (todos a partir do df_filtered) =========
-# Série diária
-daily = (
-    df_filtered.groupby("pickup_date", as_index=False)
-    .agg(trips=("pickup_datetime", "count"))
+# ========= CHARTS =========
+# Série diária (usando trips__hr se disponível)
+series_daily = (
+    daily_f
+    .assign(trips_plot=daily_f["trips__hr"] if "trips__hr" in daily_f.columns else daily_f["trips"])
+    .groupby("pickup_date", as_index=False)["trips_plot"].sum()
     .sort_values("pickup_date")
 )
 st.plotly_chart(
-    px.line(daily, x="pickup_date", y="trips", title="Viagens por dia"),
+    px.line(series_daily, x="pickup_date", y="trips_plot", title="Viagens por dia (filtrado por hora via DOW)"),
     use_container_width=True,
 )
 
-# Heatmap hora × dia-da-semana (como antes, mas do filtrado)
+# Heatmap hora × dia-da-semana (exato, pois vem de agg_hour_dow)
 heat = (
-    df_filtered.groupby(["pickup_dow_num", "pickup_hour"], as_index=False)
-    .agg(trips=("pickup_datetime", "count"))
+    hourdow[
+        (hourdow["pickup_hour"] >= hr_min) & (hourdow["pickup_hour"] <= hr_max)
+    ]
+    .groupby(["pickup_dow_num", "pickup_hour"], as_index=False)["trips"].sum()
     .pivot(index="pickup_dow_num", columns="pickup_hour", values="trips")
     .fillna(0)
 )
@@ -192,37 +165,40 @@ st.plotly_chart(
     use_container_width=True,
 )
 
-# Ranking de zonas (top 15 por trips) — juntando nomes a partir do GeoJSON
-by_zone = (
-    df_filtered.groupby("pulocationid", as_index=False)
-    .agg(trips=("pickup_datetime", "count"),
-         revenue_total=("total_amount", "sum") if "total_amount" in df_filtered.columns else ("pickup_datetime","count"))
-)
-by_zone = by_zone.merge(zone_lkp, on="pulocationid", how="left")
+# Ranking de zonas (aproximação: escala global — ordem não muda sem base por hora/zone)
+zonepu_scaled = zonepu.copy()
+if "trips" in zonepu_scaled.columns:
+    zonepu_scaled["trips"] = zonepu_scaled["trips"] * global_ratio
+if "revenue_total" in zonepu_scaled.columns:
+    zonepu_scaled["revenue_total"] = zonepu_scaled["revenue_total"] * global_ratio
+
 top = (
-    by_zone.sort_values("trips", ascending=False)
-    .loc[:, ["borough", "zone", "trips", "revenue_total"]]
+    zonepu_scaled.groupby(["borough", "zone"], as_index=False)
+    .agg(trips=("trips", "sum"),
+         revenue=("revenue_total", "sum") if "revenue_total" in zonepu_scaled.columns else ("trips","sum"))
+    .sort_values("trips", ascending=False)
     .head(15)
 )
 st.dataframe(top, use_container_width=True)
 
-# Mapa por zona (match por ID: properties.LocationID ↔ pulocationid)
-mapdf = by_zone[["pulocationid", "trips"]].rename(columns={"pulocationid": "LocationID"})
+# Mapa por zona (escala global — cor reage ao filtro de hora; ranking relativo permanece igual)
+zone_counts = zonepu_scaled.groupby("zone", as_index=False)["trips"].sum()
 fig = px.choropleth_mapbox(
-    mapdf,
+    zone_counts,
     geojson=taxi_gj,
-    locations="LocationID",
-    featureidkey="properties.LocationID",
+    locations="zone",
+    featureidkey="properties.zone",
     color="trips",
-    mapbox_style="open-street-map",  # sem token
+    mapbox_style="open-street-map",
     zoom=9,
     center={"lat": 40.7128, "lon": -74.0060},
     opacity=0.6,
-    title="Pickups por zona (filtrado por data e hora)",
+    title="Pickups por zona (filtrado por hora — aproximação global)",
 )
 st.plotly_chart(fig, use_container_width=True)
 
 st.caption(
-    "Todos os visuais e KPIs derivam do mesmo df_filtered (data+hora). "
-    "Para renomear zonas/bairros no ranking, os nomes vêm do próprio GeoJSON."
+    "Filtro de hora aplicado globalmente por ponderação Hora×DOW. "
+    "Para que o ranking de zonas mude com a hora, é necessário ter agregação por hora por zona "
+    "(ex.: yellow_trips_2025 → groupby [pulocationid, pickup_hour]) ou materializar 'agg_zone_pickup_hour_v3'."
 )
