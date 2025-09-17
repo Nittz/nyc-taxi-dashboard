@@ -1,158 +1,198 @@
-# app/app.py
-import os, json, requests
-import pandas as pd
-import plotly.express as px
+# app.py
 import streamlit as st
+import pandas as pd
+import altair as alt
 
-st.set_page_config(page_title="NYC Yellow Taxi — Jun–Jul 2025", layout="wide")
+# Configura a página: título e layout em largura total
+st.set_page_config(page_title="NYC Taxi — v3", layout="wide")
 
-# ========= CONFIG =========
-# Ajuste via Secrets (Streamlit Cloud) ou deixe os defaults:
-BUCKET = os.getenv("BUCKET", "nyc-taxi-portfolio-frm")
-PREFIX = os.getenv("PREFIX", "agg")
-S3_PATH = f"s3://{BUCKET}/{PREFIX}"
+# ------------------------------------
+# 1) Carregamento e preparo das colunas
+# ------------------------------------
+@st.cache_data(show_spinner=True)
+def load_data():
+    # Leitura inicial de um Parquet local (substituir por S3/Athena apenas neste bloco quando necessário).
+    raise_if_no_data = False
+    try:
+        df = pd.read_parquet("agg-v3.parquet")  # caminho local; ajustar se a fonte mudar
+    except Exception:
+        if raise_if_no_data:
+            raise
+        # Dataset sintético para a aplicação iniciar e permitir ajustes de layout/UX antes da fonte real
+        rng = pd.date_range("2024-01-01", periods=10000, freq="H")
+        df = pd.DataFrame({
+            "pickup_datetime": rng,
+            "vendorid": 1,
+            "total_amount": 10
+        })
 
-# Se houver AWS keys (via Secrets), usa-as; senão tenta leitura anônima
-_has_keys = bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
-STORAGE_OPTS: dict = {} if _has_keys else {"anon": True}
-if _has_keys and os.getenv("AWS_DEFAULT_REGION"):
-    STORAGE_OPTS["client_kwargs"] = {"region_name": os.getenv("AWS_DEFAULT_REGION")}
+    # Padroniza nome do timestamp para 'pickup_datetime' se vier com rótulos comuns alternativos
+    if "pickup_datetime" not in df.columns:
+        for c in ["tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_ts"]:
+            if c in df.columns:
+                df = df.rename(columns={c: "pickup_datetime"})
+                break
 
-# ========= HELPERS =========
-GEOJSON_URL = (
-    "https://data.cityofnewyork.us/api/geospatial/8meu-9t5y?method=export&format=GeoJSON"
-)  # NYC Taxi Zones (GeoJSON) — NYC Open Data
+    # Converte para datetime e remove registros inválidos
+    df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"], errors="coerce")
+    df = df.dropna(subset=["pickup_datetime"])
 
-def load_taxi_geojson():
-    """
-    1) tenta 'data/NYC Taxi Zones.geojson'
-    2) tenta 'data/taxi_zones.geojson'
-    3) fallback: baixa GeoJSON oficial do NYC Open Data
-    """
-    candidates = ["data/NYC Taxi Zones.geojson", "data/taxi_zones.geojson"]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    gj = json.load(f)
-                if isinstance(gj, dict) and gj.get("type") == "FeatureCollection":
-                    return gj
-            except Exception:
-                pass
-    r = requests.get(GEOJSON_URL, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    # Caso a origem esteja em UTC e a visualização precise de fuso NYC, usar a linha abaixo:
+    # df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"], utc=True).dt.tz_convert("America/New_York")
 
+    # Colunas auxiliares para filtros e visuais
+    df["pickup_date"] = df["pickup_datetime"].dt.date
+    df["pickup_hour"] = df["pickup_datetime"].dt.hour
+    df["dow"] = df["pickup_datetime"].dt.day_name()
+
+    # Ordem fixa dos dias para consistência no heatmap
+    cats = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    df["dow"] = pd.Categorical(df["dow"], categories=cats, ordered=True)
+
+    return df
+
+df = load_data()
+
+# ------------------------------
+# 2) Sidebar com filtros globais
+# ------------------------------
+st.sidebar.header("Filtros")
+
+# Intervalo de datas derivado do próprio dataset
+min_date = pd.to_datetime(df["pickup_date"]).min()
+max_date = pd.to_datetime(df["pickup_date"]).max()
+
+date_sel = st.sidebar.date_input(
+    "Período",
+    value=(min_date.date(), max_date.date()),
+    min_value=min_date.date(),
+    max_value=max_date.date()
+)
+
+# Filtro de horas (0–23); por padrão, todas selecionadas
+hours_default = list(range(24))
+hours_sel = st.sidebar.multiselect(
+    "Horas do dia (0–23)",
+    options=hours_default,
+    default=hours_default
+)
+
+# Filtro de vendor exibido somente se a coluna existir
+vendors = sorted(df["vendorid"].dropna().unique().tolist()) if "vendorid" in df.columns else []
+vendor_sel = st.sidebar.multiselect(
+    "Vendor",
+    options=vendors,
+    default=vendors
+) if vendors else []
+
+# ---------------------------------------------------
+# 3) Aplicação única dos filtros (fonte da verdade)
+# ---------------------------------------------------
 @st.cache_data(show_spinner=False)
-def read_parquet_dir(path: str) -> pd.DataFrame:
-    # Lê um diretório de Parquets (CTAS do Athena) no S3
-    return pd.read_parquet(path, storage_options=STORAGE_OPTS)
+def apply_filters(df, date_range, hours, vendors):
+    # Centraliza a lógica de filtros; todos os visuais/kpis derivam deste resultado
+    d1, d2 = date_range
+    df2 = df[(df["pickup_date"] >= d1) & (df["pickup_date"] <= d2)]
+    if hours:
+        df2 = df2[df2["pickup_hour"].isin(hours)]
+    if vendors:
+        df2 = df2[df2["vendorid"].isin(vendors)]
+    return df2
 
-def guard_df(df: pd.DataFrame, name: str):
-    if df is None or len(df) == 0:
-        st.error(f"Nenhum dado em {name}. Confira no S3: {S3_PATH}/{name}/")
-        st.stop()
+df_filtered = apply_filters(df, date_sel, hours_sel, vendor_sel)
 
-# ========= LOAD DATA =========
-try:
-    daily   = read_parquet_dir(f"{S3_PATH}/agg_daily/")
-    hourdow = read_parquet_dir(f"{S3_PATH}/agg_hour_dow/")
-    zonepu  = read_parquet_dir(f"{S3_PATH}/agg_zone_pickup/")
-    pay     = read_parquet_dir(f"{S3_PATH}/agg_payment/")
-except Exception as e:
-    st.error(f"Erro ao ler Parquet no S3 ({S3_PATH}). Detalhe: {e}")
-    st.info(
-        "Se o bucket for privado, preencha em Settings → Secrets: "
-        "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION "
-        "além de (opcional) BUCKET/PREFIX. "
-        "Alternativa: torne público somente o prefixo agg/*."
-    )
+# Evita métricas/visuais vazios quando nenhuma hora for selecionada
+if len(hours_sel) == 0:
+    st.warning("Selecione pelo menos uma hora para aplicar o filtro.")
     st.stop()
 
-# sanity e tipos
-guard_df(daily,   "agg_daily")
-guard_df(hourdow, "agg_hour_dow")
-guard_df(zonepu,  "agg_zone_pickup")
-guard_df(pay,     "agg_payment")
-daily["pickup_date"] = pd.to_datetime(daily["pickup_date"])
-pay["pickup_date"]   = pd.to_datetime(pay["pickup_date"])
+# -----------------------------------
+# 4) KPIs — sempre com base no filtrado
+# -----------------------------------
+col1, col2, col3 = st.columns(3)
 
-# ========= GEOJSON =========
-taxi_gj = load_taxi_geojson()
+with col1:
+    st.metric("Corridas (registros)", value=f"{len(df_filtered):,}")
 
-# ========= UI / FILTERS =========
-st.title("🚕 NYC Yellow Taxi — Jun–Jul 2025")
-st.caption(
-    "Fonte: NYC TLC Trip Record Data (Parquet) • Pré-agregações por Athena CTAS • "
-    "Mapa: NYC Taxi Zones (GeoJSON)."
+with col2:
+    if "total_amount" in df_filtered.columns:
+        st.metric("Receita total", value=f"${df_filtered['total_amount'].sum():,.2f}")
+    else:
+        st.metric("Receita total", value="—")
+
+with col3:
+    daily_trips = df_filtered.groupby("pickup_date", as_index=False).size()
+    st.metric("Média diária (corridas)", value=f"{daily_trips['size'].mean():.1f}" if not daily_trips.empty else "—")
+
+st.divider()
+
+# -------------------------------------------------------------------
+# 5) Série diária — filtra por hora primeiro e agrega por dia depois
+# -------------------------------------------------------------------
+daily = (
+    df_filtered
+    .groupby("pickup_date", as_index=False)
+    .agg(trips=("pickup_datetime", "count"),
+         total_amount=("total_amount", "sum"))
 )
 
-min_d, max_d = daily["pickup_date"].min().date(), daily["pickup_date"].max().date()
-c1, c2 = st.columns([2, 1])
-dr = c1.date_input("Período", [min_d, max_d], min_value=min_d, max_value=max_d)
-hr_min, hr_max = c2.select_slider("Hora (pickup)", options=list(range(24)), value=(0, 23))
+left, right = st.columns(2)
 
-d0, d1 = pd.to_datetime(dr[0]), pd.to_datetime(dr[1])
-daily_f   = daily[(daily.pickup_date >= d0) & (daily.pickup_date <= d1)]
-hourdow_f = hourdow[(hourdow.pickup_hour >= hr_min) & (hourdow.pickup_hour <= hr_max)]
-zonepu_f  = zonepu.copy()  # (agg de zonas já vem totalizado p/ jun–jul)
-pay_f     = pay[(pay.pickup_date >= d0) & (pay.pickup_date <= d1)]
+with left:
+    chart_trips = (
+        alt.Chart(daily)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("pickup_date:T", title="Dia"),
+            y=alt.Y("trips:Q", title="Corridas"),
+            tooltip=["pickup_date:T", "trips:Q"]
+        )
+        .properties(height=300)
+    )
+    st.altair_chart(chart_trips, use_container_width=True)
 
-# ========= KPIs =========
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Viagens", f"{int(daily_f['trips'].sum()):,}")
-k2.metric("Receita ($)", f"{daily_f['revenue_total'].sum():,.0f}")
-k3.metric("Tarifa média ($)", f"{daily_f['avg_fare'].mean():.2f}")
-k4.metric("Tip % médio", f"{100 * daily_f['avg_tip_pct'].mean():.1f}%")
-k5.metric("Distância média (mi)", f"{daily_f['avg_trip_miles'].mean():.2f}")
+with right:
+    if "total_amount" in daily.columns:
+        chart_rev = (
+            alt.Chart(daily)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("pickup_date:T", title="Dia"),
+                y=alt.Y("total_amount:Q", title="Receita"),
+                tooltip=["pickup_date:T", "total_amount:Q"]
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(chart_rev, use_container_width=True)
+    else:
+        st.info("Coluna total_amount não encontrada; gráfico de receita não exibido.")
 
-# ========= CHARTS =========
-# Série diária
-# garantir 1 linha por dia e ordenar
-series_daily = (
-    daily_f.loc[:, ["pickup_date", "trips"]]
-            .groupby("pickup_date", as_index=False)["trips"].sum()
-            .sort_values("pickup_date")
+st.divider()
+
+# -----------------------------------------
+# 6) Heatmap — intensidade por Hora x Dia
+# -----------------------------------------
+heat = (
+    df_filtered
+    .groupby(["dow","pickup_hour"], as_index=False)
+    .agg(trips=("pickup_datetime", "count"))
 )
-fig_daily = px.line(series_daily, x="pickup_date", y="trips", markers=True,
-                    title="Viagens por dia")
-st.plotly_chart(fig_daily, use_container_width=True)
 
-
-# Heatmap hora × dia-da-semana
-heat = hourdow_f.pivot_table(index="pickup_dow_num", columns="pickup_hour",
-                             values="trips", aggfunc="sum").fillna(0)
-st.plotly_chart(
-    px.imshow(heat, aspect="auto", title="Heatmap (dia da semana × hora)"),
-    use_container_width=True,
+heatmap = (
+    alt.Chart(heat)
+    .mark_rect()
+    .encode(
+        x=alt.X("pickup_hour:O", title="Hora do dia"),
+        y=alt.Y("dow:O", title="Dia da semana"),
+        color=alt.Color("trips:Q", title="Corridas"),
+        tooltip=["dow:O", "pickup_hour:O", "trips:Q"]
+    )
+    .properties(height=280)
 )
+st.altair_chart(heatmap, use_container_width=True)
 
-# Ranking de zonas (top 15 por trips)
-top = (
-    zonepu_f.groupby(["borough", "zone"], as_index=False)
-    .agg(trips=("trips", "sum"), revenue=("revenue_total", "sum"))
-    .sort_values("trips", ascending=False)
-    .head(15)
-)
-st.dataframe(top, use_container_width=True)
-
-# Mapa por zona (match por nome: properties.zone)
-zone_counts = zonepu_f.groupby("zone", as_index=False)["trips"].sum()
-fig = px.choropleth_mapbox(
-    zone_counts,
-    geojson=taxi_gj,
-    locations="zone",
-    featureidkey="properties.zone",
-    color="trips",
-    mapbox_style="open-street-map",  # sem token
-    zoom=9,
-    center={"lat": 40.7128, "lon": -74.0060},
-    opacity=0.6,
-    title="Pickups por zona (jun–jul/2025)",
-)
-st.plotly_chart(fig, use_container_width=True)
-
-st.caption(
-    "CTAS grava Parquet diretamente no S3 (external_location). "
-    "Se precisar casar ID↔zona/borough, use o Taxi Zone Lookup CSV do TLC."
-)
+# ----------------------------------------------------
+# 7) Amostra dos dados já filtrados (inspeção rápida)
+# ----------------------------------------------------
+with st.expander("Ver amostra dos dados filtrados"):
+    st.dataframe(df_filtered.head(50), use_container_width=True)
