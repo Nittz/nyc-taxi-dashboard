@@ -1,198 +1,106 @@
-# app.py
-import streamlit as st
+# --- imports (já devem existir no seu app)
+import os, json
 import pandas as pd
-import altair as alt
+import plotly.express as px
+import streamlit as st
 
-# Configura a página: título e layout em largura total
-st.set_page_config(page_title="NYC Taxi — v3", layout="wide")
+# --- secrets / S3
+BUCKET = st.secrets.get("BUCKET", "nyc-taxi-portfolio-frm")
+PREFIX = st.secrets.get("PREFIX", "agg_v3")  # agora apontando pro v3
+STORAGE_OPTS = {
+    "key":     st.secrets.get("AWS_ACCESS_KEY_ID"),
+    "secret":  st.secrets.get("AWS_SECRET_ACCESS_KEY"),
+    "client_kwargs": {"region_name": st.secrets.get("AWS_DEFAULT_REGION", "us-east-1")},
+}
+S3 = f"s3://{BUCKET}/{PREFIX}"
 
-# ------------------------------------
-# 1) Carregamento e preparo das colunas
-# ------------------------------------
-@st.cache_data(show_spinner=True)
-def load_data():
-    # Leitura inicial de um Parquet local (substituir por S3/Athena apenas neste bloco quando necessário).
-    raise_if_no_data = False
-    try:
-        df = pd.read_parquet("agg-v3.parquet")  # caminho local; ajustar se a fonte mudar
-    except Exception:
-        if raise_if_no_data:
-            raise
-        # Dataset sintético para a aplicação iniciar e permitir ajustes de layout/UX antes da fonte real
-        rng = pd.date_range("2024-01-01", periods=10000, freq="H")
-        df = pd.DataFrame({
-            "pickup_datetime": rng,
-            "vendorid": 1,
-            "total_amount": 10
-        })
-
-    # Padroniza nome do timestamp para 'pickup_datetime' se vier com rótulos comuns alternativos
-    if "pickup_datetime" not in df.columns:
-        for c in ["tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_ts"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "pickup_datetime"})
-                break
-
-    # Converte para datetime e remove registros inválidos
-    df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"], errors="coerce")
-    df = df.dropna(subset=["pickup_datetime"])
-
-    # Caso a origem esteja em UTC e a visualização precise de fuso NYC, usar a linha abaixo:
-    # df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"], utc=True).dt.tz_convert("America/New_York")
-
-    # Colunas auxiliares para filtros e visuais
-    df["pickup_date"] = df["pickup_datetime"].dt.date
-    df["pickup_hour"] = df["pickup_datetime"].dt.hour
-    df["dow"] = df["pickup_datetime"].dt.day_name()
-
-    # Ordem fixa dos dias para consistência no heatmap
-    cats = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    df["dow"] = pd.Categorical(df["dow"], categories=cats, ordered=True)
-
-    return df
-
-df = load_data()
-
-# ------------------------------
-# 2) Sidebar com filtros globais
-# ------------------------------
-st.sidebar.header("Filtros")
-
-# Intervalo de datas derivado do próprio dataset
-min_date = pd.to_datetime(df["pickup_date"]).min()
-max_date = pd.to_datetime(df["pickup_date"]).max()
-
-date_sel = st.sidebar.date_input(
-    "Período",
-    value=(min_date.date(), max_date.date()),
-    min_value=min_date.date(),
-    max_value=max_date.date()
-)
-
-# Filtro de horas (0–23); por padrão, todas selecionadas
-hours_default = list(range(24))
-hours_sel = st.sidebar.multiselect(
-    "Horas do dia (0–23)",
-    options=hours_default,
-    default=hours_default
-)
-
-# Filtro de vendor exibido somente se a coluna existir
-vendors = sorted(df["vendorid"].dropna().unique().tolist()) if "vendorid" in df.columns else []
-vendor_sel = st.sidebar.multiselect(
-    "Vendor",
-    options=vendors,
-    default=vendors
-) if vendors else []
-
-# ---------------------------------------------------
-# 3) Aplicação única dos filtros (fonte da verdade)
-# ---------------------------------------------------
+# --- cache de leitura: baixa uma vez por execução/inputs e reutiliza
 @st.cache_data(show_spinner=False)
-def apply_filters(df, date_range, hours, vendors):
-    # Centraliza a lógica de filtros; todos os visuais/kpis derivam deste resultado
-    d1, d2 = date_range
-    df2 = df[(df["pickup_date"] >= d1) & (df["pickup_date"] <= d2)]
-    if hours:
-        df2 = df2[df2["pickup_hour"].isin(hours)]
-    if vendors:
-        df2 = df2[df2["vendorid"].isin(vendors)]
-    return df2
+def load_parquet(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path, storage_options=STORAGE_OPTS)
+# (st.cache_data é o decorador recomendado para funções que retornam dados; acelera o app) :contentReference[oaicite:5]{index=5}
 
-df_filtered = apply_filters(df, date_sel, hours_sel, vendor_sel)
+# --- carrega os agregados por HORA (v3)
+daily_h = load_parquet(f"{S3}/agg_daily_hour/")
+zone_h  = load_parquet(f"{S3}/agg_zone_pickup_hour/")
+pay_h   = load_parquet(f"{S3}/agg_payment_hour/")
 
-# Evita métricas/visuais vazios quando nenhuma hora for selecionada
-if len(hours_sel) == 0:
-    st.warning("Selecione pelo menos uma hora para aplicar o filtro.")
-    st.stop()
+# --- filtros globais: datas + HORA
+dmin, dmax = pd.to_datetime("2025-06-01"), pd.to_datetime("2025-07-31")
+sel_date = st.slider("Período", min_value=dmin, max_value=dmax, value=(dmin, dmax))
+hmin, hmax = st.slider("Hora (pickup)", 0, 23, (0, 23))  # range slider de hora (0–23) :contentReference[oaicite:6]{index=6}
 
-# -----------------------------------
-# 4) KPIs — sempre com base no filtrado
-# -----------------------------------
-col1, col2, col3 = st.columns(3)
+# aplica os filtros em TODOS os dataframes
+mask_d = (daily_h["pickup_date"] >= sel_date[0]) & (daily_h["pickup_date"] <= sel_date[1])
+mask_h = (daily_h["pickup_hour"] >= hmin) & (daily_h["pickup_hour"] <= hmax)
+dsel = daily_h.loc[mask_d & mask_h].copy()
 
-with col1:
-    st.metric("Corridas (registros)", value=f"{len(df_filtered):,}")
+mask_z = (zone_h["pickup_hour"] >= hmin) & (zone_h["pickup_hour"] <= hmax)
+zone_sel = zone_h.loc[mask_z].copy()
+zone_sel = zone_sel[(zone_sel["year"]==2025) & (zone_sel["month"].isin([6,7])) &
+                    (zone_sel["borough"].notna()) & (zone_sel["zone"].notna())]
 
-with col2:
-    if "total_amount" in df_filtered.columns:
-        st.metric("Receita total", value=f"${df_filtered['total_amount'].sum():,.2f}")
-    else:
-        st.metric("Receita total", value="—")
+mask_p = (pay_h["pickup_date"] >= sel_date[0]) & (pay_h["pickup_date"] <= sel_date[1]) & \
+         (pay_h["pickup_hour"] >= hmin) & (pay_h["pickup_hour"] <= hmax)
+pay_sel = pay_h.loc[mask_p].copy()
 
-with col3:
-    daily_trips = df_filtered.groupby("pickup_date", as_index=False).size()
-    st.metric("Média diária (corridas)", value=f"{daily_trips['size'].mean():.1f}" if not daily_trips.empty else "—")
+# --- KPIs (médias ponderadas corretas)
+trips_total   = int(dsel["trips"].sum())
+revenue_total = float(dsel["total_sum"].sum())
+fare_sum      = float(dsel["fare_sum"].sum())
+tip_sum       = float(dsel["tip_sum"].sum())
+dist_sum      = float(dsel["distance_sum"].sum())
 
-st.divider()
+avg_fare    = (fare_sum / trips_total) if trips_total else 0.0
+avg_tip_pct = (tip_sum / fare_sum) if fare_sum else 0.0
+avg_miles   = (dist_sum / trips_total) if trips_total else 0.0
 
-# -------------------------------------------------------------------
-# 5) Série diária — filtra por hora primeiro e agrega por dia depois
-# -------------------------------------------------------------------
-daily = (
-    df_filtered
-    .groupby("pickup_date", as_index=False)
-    .agg(trips=("pickup_datetime", "count"),
-         total_amount=("total_amount", "sum"))
+# --- Série diária (1 ponto por dia)
+series_daily = (dsel.groupby("pickup_date", as_index=False)
+                    .agg(trips=("trips","sum"))
+                    .sort_values("pickup_date"))
+fig_daily = px.line(series_daily, x="pickup_date", y="trips", markers=True,
+                    title="Viagens por dia (filtrado por hora)")
+st.plotly_chart(fig_daily, use_container_width=True)
+
+# --- Heatmap hora × dia da semana (a partir dos próprios dsel)
+# OBS: day_of_week() no Athena/Trino retorna 1..7; aqui no Python vamos recalcular
+dsel["pickup_dow_num"] = pd.to_datetime(dsel["pickup_date"]).dt.dayofweek + 1  # 1=seg..7=dom (coerente com Athena) :contentReference[oaicite:7]{index=7}
+heat = (dsel.groupby(["pickup_hour","pickup_dow_num"], as_index=False)
+            .agg(trips=("trips","sum")))
+fig_heat = px.density_heatmap(heat, x="pickup_hour", y="pickup_dow_num", z="trips",
+                              title="Hora × Dia da semana (trips)")
+st.plotly_chart(fig_heat, use_container_width=True)
+
+# --- Ranking por zona (agrega com filtro de hora)
+top_zones = (zone_sel.groupby(["borough","zone"], as_index=False)
+                    .agg(trips=("trips","sum"),
+                         revenue_total=("total_sum","sum"))
+                    .sort_values("trips", ascending=False)
+                    .head(20))
+
+# --- Mapa (choropleth) com GeoJSON: certifique-se de carregar taxi_zones (arquivo local 'data/NYC Taxi Zones.geojson')
+# a chave de match depende do seu geojson (ex.: 'properties.zone' ou 'properties.LocationID'):
+with open("data/NYC Taxi Zones.geojson", "r") as f:
+    taxi_gj = json.load(f)
+
+mapdf = (zone_sel.groupby(["zone"], as_index=False)
+                 .agg(trips=("trips","sum")))
+fig_map = px.choropleth_mapbox(
+    mapdf,
+    geojson=taxi_gj,
+    locations="zone",
+    color="trips",
+    featureidkey="properties.zone",  # se o seu geojson usa LocationID, troque para 'properties.LocationID' e mude "locations" também
+    mapbox_style="carto-positron",
+    center={"lat": 40.7128, "lon": -74.0060}, zoom=9,
+    opacity=0.6, title="Trips por zona (filtrado por hora)"
 )
+st.plotly_chart(fig_map, use_container_width=True)  # API do PX para choropleth_mapbox e featureidkey :contentReference[oaicite:8]{index=8}
 
-left, right = st.columns(2)
-
-with left:
-    chart_trips = (
-        alt.Chart(daily)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("pickup_date:T", title="Dia"),
-            y=alt.Y("trips:Q", title="Corridas"),
-            tooltip=["pickup_date:T", "trips:Q"]
-        )
-        .properties(height=300)
-    )
-    st.altair_chart(chart_trips, use_container_width=True)
-
-with right:
-    if "total_amount" in daily.columns:
-        chart_rev = (
-            alt.Chart(daily)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("pickup_date:T", title="Dia"),
-                y=alt.Y("total_amount:Q", title="Receita"),
-                tooltip=["pickup_date:T", "total_amount:Q"]
-            )
-            .properties(height=300)
-        )
-        st.altair_chart(chart_rev, use_container_width=True)
-    else:
-        st.info("Coluna total_amount não encontrada; gráfico de receita não exibido.")
-
-st.divider()
-
-# -----------------------------------------
-# 6) Heatmap — intensidade por Hora x Dia
-# -----------------------------------------
-heat = (
-    df_filtered
-    .groupby(["dow","pickup_hour"], as_index=False)
-    .agg(trips=("pickup_datetime", "count"))
-)
-
-heatmap = (
-    alt.Chart(heat)
-    .mark_rect()
-    .encode(
-        x=alt.X("pickup_hour:O", title="Hora do dia"),
-        y=alt.Y("dow:O", title="Dia da semana"),
-        color=alt.Color("trips:Q", title="Corridas"),
-        tooltip=["dow:O", "pickup_hour:O", "trips:Q"]
-    )
-    .properties(height=280)
-)
-st.altair_chart(heatmap, use_container_width=True)
-
-# ----------------------------------------------------
-# 7) Amostra dos dados já filtrados (inspeção rápida)
-# ----------------------------------------------------
-with st.expander("Ver amostra dos dados filtrados"):
-    st.dataframe(df_filtered.head(50), use_container_width=True)
+# --- Payment por dia
+pay_series = (pay_sel.groupby(["pickup_date","payment_type"], as_index=False)
+                     .agg(trips=("trips","sum")))
+fig_pay = px.bar(pay_series, x="pickup_date", y="trips", color="payment_type",
+                 title="Trips por forma de pagamento (por dia, filtrado por hora)")
+st.plotly_chart(fig_pay, use_container_width=True)
